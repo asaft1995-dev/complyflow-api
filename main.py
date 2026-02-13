@@ -4,61 +4,89 @@ from typing import Optional, Any, Dict, List
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 
-# -------------------------
-# Config (ENV)
-# -------------------------
-PROJECT_ID = os.getenv("PROJECT_ID", "asafturjeman")
-LOCATION = os.getenv("LOCATION", "us-central1")
-AGENT_ID = os.getenv("AGENT_ID", "28b9247b-716c-4fac-9d86-22791f29f510")
+# ============================================================
+# Config (ENV with safe defaults for YOUR current project)
+# ============================================================
 
-# Optional: force the conversation to start/continue from a specific playbook
-# Must be the FULL resource name:
-# projects/<PROJECT>/locations/<LOC>/agents/<AGENT_ID>/playbooks/<PLAYBOOK_ID>
-CURRENT_PLAYBOOK = os.getenv("CURRENT_PLAYBOOK")  # optional
+# Defaulting to your valid project/agent to avoid "invalid project" issues
+PROJECT_ID = os.getenv("PROJECT_ID", "yuvalfrank").strip()
+LOCATION = os.getenv("LOCATION", "us-central1").strip()
+AGENT_ID = os.getenv("AGENT_ID", "b470ba36-2b1d-4f48-a334-3bcdc5162445").strip()
 
-LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "he")  # "he" or "en"
-DIALOGFLOW_API_BASE = os.getenv("DIALOGFLOW_API_BASE", "https://dialogflow.googleapis.com/v3")
+LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "he").strip()
+DIALOGFLOW_API_BASE = os.getenv("DIALOGFLOW_API_BASE", "https://dialogflow.googleapis.com/v3").strip()
+
+# Optional: force start/continue from a specific playbook (full resource name)
+CURRENT_PLAYBOOK = os.getenv("CURRENT_PLAYBOOK")
+CURRENT_PLAYBOOK = CURRENT_PLAYBOOK.strip() if CURRENT_PLAYBOOK else None
+
+# Vision Tool (from your OpenAPI)
+VISION_TOOL_URL = os.getenv(
+    "VISION_TOOL_URL",
+    "https://business-vision-analyzer-550357153823.us-central1.run.app/"
+).strip()
+
+# CORS (set to your GitHub Pages origin; use * only for quick testing)
+# Example:
+# CORS_ALLOW_ORIGINS="https://asaft1995.github.io"
+CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+CORS_ALLOW_ORIGINS = ["*"] if CORS_ALLOW_ORIGINS_RAW == "*" else [
+    o.strip() for o in CORS_ALLOW_ORIGINS_RAW.split(",") if o.strip()
+]
 
 AGENT_PATH = f"projects/{PROJECT_ID}/locations/{LOCATION}/agents/{AGENT_ID}"
 
 
-# -------------------------
+# ============================================================
 # FastAPI
-# -------------------------
-app = FastAPI(title="ComplyFlow Gateway (Cloud Run → Conversational Agent)")
+# ============================================================
+app = FastAPI(title="ComplyFlow Gateway (Cloud Run → Dialogflow CX)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
+    # base64 ONLY (no "data:image/...;base64," prefix)
+    image_data: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
-    # Keep the UI stable: these are extracted if available, otherwise None/empty
     business_profile: Dict[str, Optional[str]]
     compliance_checklist: List[str]
-    # Optional: include raw response for debugging (set DEBUG_RAW=1)
+    vision_debug: Optional[Dict[str, Any]] = None
     raw_agent_response: Optional[Dict[str, Any]] = None
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": AGENT_PATH}
+    return {
+        "status": "ok",
+        "agent_path": AGENT_PATH,
+        "vision_tool_url": VISION_TOOL_URL,
+        "language_code": LANGUAGE_CODE,
+        "current_playbook": CURRENT_PLAYBOOK,
+        "cors_allow_origins": CORS_ALLOW_ORIGINS,
+    }
 
 
 def _get_access_token() -> str:
-    """
-    Uses Cloud Run's service account (Application Default Credentials)
-    to obtain an OAuth2 access token for calling Dialogflow API.
-    """
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     creds.refresh(GoogleAuthRequest())
     if not creds.token:
@@ -67,55 +95,34 @@ def _get_access_token() -> str:
 
 
 def _extract_reply_text(df_response: Dict[str, Any]) -> str:
-    """
-    Extracts the best-effort text response from detectIntent response.
-    """
-    # detectIntent response has queryResult.responseMessages[]
-    query_result = df_response.get("queryResult", {})
+    query_result = df_response.get("queryResult", {}) or {}
     msgs = query_result.get("responseMessages", []) or []
 
-    texts: List[str] = []
+    chunks: List[str] = []
     for m in msgs:
-        # Typical: { "text": { "text": ["..."] } }
-        t = (m.get("text") or {}).get("text")
-        if isinstance(t, list):
-            texts.extend([x for x in t if isinstance(x, str)])
-        elif isinstance(t, str):
-            texts.append(t)
+        txt = (m.get("text") or {}).get("text")
+        if isinstance(txt, list):
+            chunks.extend([t for t in txt if isinstance(t, str)])
+        elif isinstance(txt, str):
+            chunks.append(txt)
 
-    # fallback
-    if texts:
-        return "\n".join(texts).strip()
-    return "קיבלתי. איך תרצה להמשיך?"
+    return "\n".join(chunks).strip() if chunks else "קיבלתי. איך תרצה להמשיך?"
 
 
 def _extract_session_params(df_response: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Session parameters often appear under queryResult.parameters
-    (format: Struct). We best-effort extract known keys.
-    """
-    query_result = df_response.get("queryResult", {})
+    query_result = df_response.get("queryResult", {}) or {}
     params = query_result.get("parameters") or {}
-    # Some responses wrap parameters differently; keep best-effort.
-    if not isinstance(params, dict):
-        return {}
-    return params
+    return params if isinstance(params, dict) else {}
 
 
 def _normalize_for_ui(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map session parameters to the UI schema you want.
-    Adjust keys to match what your playbooks actually write.
-    """
-    # These keys are placeholders — change them to match your playbook parameter names
+    # Adjust these keys to match your playbook parameter names
     business_stage = params.get("business_stage")
     license_status = params.get("license_status")
     business_tags = params.get("business_tags")
 
-    # Checklist might come as an array parameter from your playbook
     checklist = params.get("compliance_checklist") or []
 
-    # Normalize checklist to list[str]
     if isinstance(checklist, str):
         checklist_list = [checklist]
     elif isinstance(checklist, list):
@@ -129,13 +136,33 @@ def _normalize_for_ui(params: Dict[str, Any]) -> Dict[str, Any]:
             "license_status": str(license_status) if license_status is not None else None,
             "business_tags": str(business_tags) if business_tags is not None else None,
         },
-        "compliance_checklist": checklist_list
+        "compliance_checklist": checklist_list,
     }
+
+
+def _call_vision_tool(image_b64: str) -> Dict[str, Any]:
+    try:
+        r = requests.post(
+            VISION_TOOL_URL,
+            headers={"Content-Type": "application/json"},
+            json={"image_data": image_b64},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return {"success": False, "error": f"Vision HTTP {r.status_code}: {r.text[:500]}"}
+
+        data = r.json()
+        if not isinstance(data, dict) or "vision_data" not in data:
+            return {"success": False, "error": "Vision payload missing vision_data"}
+
+        return data
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    session_id = (req.session_id or str(uuid.uuid4()))[:36]  # DF recommends <= 36 chars :contentReference[oaicite:1]{index=1}
+    session_id = (req.session_id or str(uuid.uuid4()))[:36]
     session_path = f"{AGENT_PATH}/sessions/{session_id}"
     url = f"{DIALOGFLOW_API_BASE}/{session_path}:detectIntent"
 
@@ -145,17 +172,31 @@ def chat(req: ChatRequest):
         "Content-Type": "application/json; charset=utf-8",
     }
 
+    # 1) Vision outside Dialogflow (only if image uploaded)
+    vision_result: Optional[Dict[str, Any]] = None
+    if req.image_data:
+        vision_result = _call_vision_tool(req.image_data)
+
+    # 2) Dialogflow detectIntent request
     body: Dict[str, Any] = {
         "queryInput": {
             "languageCode": LANGUAGE_CODE,
-            "text": {"text": req.message}
+            "text": {"text": req.message},
         }
     }
 
-    # If you want to force start/continue the session from a specific playbook:
-    # QueryParameters.currentPlaybook supports full playbook resource name :contentReference[oaicite:2]{index=2}
+    query_params: Dict[str, Any] = {}
     if CURRENT_PLAYBOOK:
-        body["queryParams"] = {"currentPlaybook": CURRENT_PLAYBOOK}
+        query_params["currentPlaybook"] = CURRENT_PLAYBOOK
+
+    # Pass small vision_data (NOT the base64) as session parameters
+    if vision_result and vision_result.get("success") and isinstance(vision_result.get("vision_data"), dict):
+        query_params.setdefault("parameters", {})
+        query_params["parameters"]["vision_data"] = vision_result["vision_data"]
+        query_params["parameters"]["has_image"] = True
+
+    if query_params:
+        body["queryParams"] = query_params
 
     resp = requests.post(url, headers=headers, json=body, timeout=30)
     if resp.status_code >= 400:
@@ -168,10 +209,13 @@ def chat(req: ChatRequest):
     ui = _normalize_for_ui(params)
 
     debug_raw = os.getenv("DEBUG_RAW") == "1"
+    debug_vision = os.getenv("DEBUG_VISION") == "1"
+
     return ChatResponse(
         session_id=session_id,
         reply=reply_text,
         business_profile=ui["business_profile"],
         compliance_checklist=ui["compliance_checklist"],
-        raw_agent_response=df_response if debug_raw else None
+        vision_debug=vision_result if debug_vision else None,
+        raw_agent_response=df_response if debug_raw else None,
     )
